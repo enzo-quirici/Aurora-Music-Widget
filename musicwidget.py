@@ -264,14 +264,21 @@ def extract_palette(img_bytes: bytes) -> Optional[dict]:
     if not COLOR_OK or not img_bytes: return None
     try:
         ct=ColorThief(io.BytesIO(img_bytes)); dom=ct.get_color(quality=1)
+        palette=ct.get_palette(color_count=4, quality=1)
         acc=QColor(*dom); h,s,v,_=acc.getHsvF()
-        acc=QColor.fromHsvF(h,min(1.0,s*1.45),min(1.0,v*1.1))
-        bg =QColor.fromHsvF(h,0.32,0.07,0.90)
-        fg =readable(QColor.fromHsvF(h,0.05,0.97),bg)
-        return dict(acc=acc, bg=bg, fg=fg,
-                    muted=QColor.fromHsvF(h,0.18,0.60),
-                    prog_bg=QColor.fromHsvF(h,0.22,0.13,0.82),
-                    glow=QColor.fromHsvF(h,min(1.0,s*1.2),min(1.0,v)))
+        acc   = QColor.fromHsvF(h, min(1.0,s*1.45), min(1.0,v*1.1))
+        # Background: very dark base, tinted with album hue
+        bg    = QColor.fromHsvF(h, 0.35, 0.06, 0.95)
+        # Mid gradient stop: slightly less dark, same hue
+        bg_mid= QColor.fromHsvF(h, 0.28, 0.10, 0.95)
+        # Gradient bottom: accent-tinted, darker
+        h2    = (h + 0.05) % 1.0
+        bg_bot= QColor.fromHsvF(h2, 0.40, 0.08, 0.95)
+        fg    = readable(QColor.fromHsvF(h, 0.05, 0.97), bg)
+        return dict(acc=acc, bg=bg, bg_mid=bg_mid, bg_bot=bg_bot, fg=fg,
+                    muted  = QColor.fromHsvF(h, 0.18, 0.62),
+                    prog_bg= QColor.fromHsvF(h, 0.22, 0.14, 0.82),
+                    glow   = QColor.fromHsvF(h, min(1.0,s*1.2), min(1.0,v)))
     except Exception as e:
         print(f"[palette] {e}"); return None
 
@@ -696,12 +703,13 @@ class MusicWidget(QWidget):
 
     # ── window setup ──────────────────────────────────────────────────────────
     def _setup_window(self):
-        flags=Qt.WindowType.FramelessWindowHint|Qt.WindowType.Tool
+        flags=Qt.WindowType.FramelessWindowHint
         if self._cfg.get("always_on_top"): flags|=Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setMouseTracking(True)
+        self.setWindowTitle("Aurora Music Widget")
 
         cw=max(MIN_W, int(self._cfg.get("win_w",DEFAULT_W)))
         ch=max(MIN_H, int(self._cfg.get("win_h",DEFAULT_H)))
@@ -720,7 +728,8 @@ class MusicWidget(QWidget):
     def _setup_palette(self):
         self._track=Track(); self._player=""
         self._art_px: Optional[QPixmap]=None; self._art_cache: dict={}
-        self._bg=AnimC(C_BG,.04);   self._acc=AnimC(C_ACC,.04)
+        self._bg    =AnimC(C_BG,.04);  self._acc=AnimC(C_ACC,.04)
+        self._bg_mid=AnimC(C_BG,.04);  self._bg_bot=AnimC(C_BG,.04)
         self._fg=AnimC(C_FG,.05);   self._mut=AnimC(C_MUT,.05)
         self._pb_bg=AnimC(C_PROG,.04); self._glow_c=AnimC(C_ACC,.035)
         self._prog=Anim(0,.05); self._spin=0.0
@@ -797,7 +806,8 @@ class MusicWidget(QWidget):
         for b in (self._btn_prev,self._btn_play,self._btn_next): b.tick()
         self._spin=(self._spin+0.22)%360
         self._glow_ph=(self._glow_ph+0.018)%(math.pi*2)
-        dirty=any([self._bg.tick(),self._acc.tick(),self._fg.tick(),self._mut.tick(),
+        dirty=any([self._bg.tick(),self._bg_mid.tick(),self._bg_bot.tick(),
+                   self._acc.tick(),self._fg.tick(),self._mut.tick(),
                    self._pb_bg.tick(),self._glow_c.tick(),self._prog.tick(),self._fade.tick()])
         if self._track.playing and self._track.duration>0:
             self._track.position=min(self._track.duration,
@@ -826,26 +836,38 @@ class MusicWidget(QWidget):
         self._btn_play.draw=_pause if tr.playing else _play
         if tr.art_bytes:
             key=tr.art_url or id(tr.art_bytes)
-            if key not in self._art_cache:
+            fresh_art=(key not in self._art_cache)
+            if fresh_art:
                 px=QPixmap(); px.loadFromData(tr.art_bytes); self._art_cache[key]=px
             self._art_px=self._art_cache[key]
-            if new: threading.Thread(target=self._do_extract,args=(tr.art_bytes,),daemon=True).start()
+            # Re-extract whenever either track metadata or art itself is new
+            if new or fresh_art:
+                snap=fresh_art   # snap colours instantly when art is truly new
+                threading.Thread(target=self._do_extract,
+                                 args=(tr.art_bytes,snap),daemon=True).start()
         else:
             self._art_px=None
 
-    def _do_extract(self,img_bytes):
+    def _do_extract(self, img_bytes, snap: bool=False):
         pal=extract_palette(img_bytes)
-        if pal:
-            self._bg.tgt=pal["bg"];  self._acc.tgt=pal["acc"]
-            self._fg.tgt=pal["fg"];  self._mut.tgt=pal["muted"]
-            self._pb_bg.tgt=pal["prog_bg"]; self._glow_c.tgt=pal["glow"]
+        if not pal: return
+        self._bg.tgt    = pal["bg"];   self._bg_mid.tgt = pal["bg_mid"]
+        self._bg_bot.tgt= pal["bg_bot"]; self._acc.tgt  = pal["acc"]
+        self._fg.tgt    = pal["fg"];   self._mut.tgt    = pal["muted"]
+        self._pb_bg.tgt = pal["prog_bg"]; self._glow_c.tgt= pal["glow"]
+        if snap:
+            # Instant colour reset so there's no bleed from previous track
+            for anim, key in [(self._bg,"bg"),(self._bg_mid,"bg_mid"),
+                              (self._bg_bot,"bg_bot"),(self._acc,"acc"),
+                              (self._glow_c,"glow")]:
+                anim.cur = QColor(pal[key])
 
     def _on_seek(self,f): self._track.position=int(f*self._track.duration); self._worker.seek(self._player,f)
     def _cmd(self,c): self._worker.cmd(self._player,c)
 
     def _apply_cfg(self, s: dict):
         self._cfg=s
-        flags=Qt.WindowType.FramelessWindowHint|Qt.WindowType.Tool
+        flags=Qt.WindowType.FramelessWindowHint
         if s.get("always_on_top"): flags|=Qt.WindowType.WindowStaysOnTopHint
         vis=self.isVisible(); self.setWindowFlags(flags)
         if vis: self.show()
@@ -891,16 +913,23 @@ class MusicWidget(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(sc,1))
             p.drawRoundedRect(QRectF(cx+i,cy+i,cw-2*i,ch-2*i),cr+i*.4,cr+i*.4)
 
-        # ── card ──────────────────────────────────────────────────────────────
+        # ── card — album art gradient background ──────────────────────────────
         card=QPainterPath(); card.addRoundedRect(QRectF(cx,cy,cw,ch),cr,cr)
-        bg_a=int(s.get("bg_alpha",225)); bg=QColor(self._bg.cur); bg.setAlpha(bg_a)
+        bg_a=int(s.get("bg_alpha",225))
+        c_top= QColor(self._bg.cur);     c_top.setAlpha(bg_a)
+        c_mid= QColor(self._bg_mid.cur); c_mid.setAlpha(bg_a)
+        c_bot= QColor(self._bg_bot.cur); c_bot.setAlpha(bg_a)
         gg=QLinearGradient(cx,cy,cx,cy+ch)
-        gg.setColorAt(0.0,bg.lighter(118)); gg.setColorAt(0.55,bg); gg.setColorAt(1.0,bg.darker(112))
+        gg.setColorAt(0.00, c_top)
+        gg.setColorAt(0.50, c_mid)
+        gg.setColorAt(1.00, c_bot)
         p.fillPath(card,QBrush(gg))
-        sh=QLinearGradient(cx,cy,cx,cy+ch*.38)
-        sh.setColorAt(0,QColor(255,255,255,22)); sh.setColorAt(1,QColor(255,255,255,0))
+        # Subtle top shimmer
+        sh=QLinearGradient(cx,cy,cx,cy+ch*.32)
+        sh.setColorAt(0,QColor(255,255,255,18)); sh.setColorAt(1,QColor(255,255,255,0))
         p.fillPath(card,QBrush(sh))
-        bc=QColor(self._acc.cur); bc.setAlpha(45)
+        # Accent border
+        bc=QColor(self._acc.cur); bc.setAlpha(50)
         p.setPen(QPen(bc,1)); p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(QRectF(cx+.5,cy+.5,cw-1,ch-1),cr,cr)
 
@@ -1037,6 +1066,7 @@ def main():
         os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     app=QApplication(sys.argv)
     app.setApplicationName("Aurora Music Widget")
+    app.setOrganizationName("aurora")
     app.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     w=MusicWidget(); w.show()
