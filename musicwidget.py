@@ -607,11 +607,17 @@ class SettingsPanel(QWidget):
         root.addLayout(slider("bg_alpha",     40,  255,  1, "{:.0f}"))
         root.addLayout(slider("corner_radius",8,   32,   1, "{:.0f}px"))
 
-        # ── Background style avec ScrollLabel ───────────────────────────────
+        # ── Background style avec texte défilant autonome ─────────────────────
         bg_row = QHBoxLayout()
+
+        # Label défilant autonome
         bg_label = ScrollLabel("Background style", px=12, bold=False,
                                color=self._text_body, parent=self)
-        bg_label.setFixedWidth(140)
+        bg_label.setFixedWidth(145)
+
+        # Pour que le texte défile même dans le panneau de settings
+        bg_label._pause = 60   # pause plus courte
+        bg_label._off.spd = 0.035  # vitesse adaptée
 
         btn_wash = QPushButton("Fluent wash")
         btn_grad = QPushButton("Colour gradient")
@@ -880,19 +886,37 @@ class MusicWidget(QWidget):
         else:
             self._art_px=None
 
-    def _do_extract(self, img_bytes, snap: bool=False):
-        pal=extract_palette(img_bytes)
-        if not pal: return
-        self._bg.tgt    = pal["bg"];   self._bg_mid.tgt = pal["bg_mid"]
-        self._bg_bot.tgt= pal["bg_bot"]; self._acc.tgt  = pal["acc"]
-        self._fg.tgt    = pal["fg"];   self._mut.tgt    = pal["muted"]
-        self._pb_bg.tgt = pal["prog_bg"]; self._glow_c.tgt= pal["glow"]
+    def _do_extract(self, img_bytes, snap: bool = False):
+        pal = extract_palette(img_bytes)
+        if not pal:
+            return
+
+        self._bg.tgt     = pal["bg"]
+        self._bg_mid.tgt = pal["bg_mid"]
+        self._bg_bot.tgt = pal["bg_bot"]
+        self._acc.tgt    = pal["acc"]
+        self._fg.tgt     = pal["fg"]
+        self._mut.tgt    = pal["muted"]
+        self._pb_bg.tgt  = pal["prog_bg"]
+
+        # Glow : on le rend plus vivant quand on est en mode Fluent Wash
+        glow_color = pal["glow"]
+        if self._cfg.get("bg_style", "wash") == "wash":
+            # En mode wash on booste un peu la saturation et luminosité du glow
+            h, s, v, a = glow_color.getHsvF()
+            glow_color = QColor.fromHsvF(h, min(1.0, s * 1.35), min(1.0, v * 1.15))
+
+        self._glow_c.tgt = glow_color
+
         if snap:
-            # Instant colour reset so there's no bleed from previous track
-            for anim, key in [(self._bg,"bg"),(self._bg_mid,"bg_mid"),
-                              (self._bg_bot,"bg_bot"),(self._acc,"acc"),
-                              (self._glow_c,"glow")]:
-                anim.cur = QColor(pal[key])
+            # Application instantanée (changement de piste)
+            for anim, key in [(self._bg, "bg"), (self._bg_mid, "bg_mid"),
+                              (self._bg_bot, "bg_bot"), (self._acc, "acc"),
+                              (self._glow_c, None)]:
+                if key:
+                    anim.cur = QColor(pal[key])
+                else:
+                    anim.cur = QColor(glow_color)
 
     def _on_seek(self,f): self._track.position=int(f*self._track.duration); self._worker.seek(self._player,f)
     def _cmd(self,c): self._worker.cmd(self._player,c)
@@ -902,7 +926,6 @@ class MusicWidget(QWidget):
         old_cfg = dict(self._cfg)
         self._cfg = dict(s)
 
-        # Only recreate window flags when "always_on_top" actually changes
         if old_cfg.get("always_on_top") != s.get("always_on_top"):
             flags = Qt.WindowType.FramelessWindowHint
             if s.get("always_on_top"):
@@ -912,10 +935,14 @@ class MusicWidget(QWidget):
             if vis:
                 self.show()
 
-        # Update progress bar visibility
         show_prog = bool(s.get("show_progress", True))
         if getattr(self, '_pbar', None) and self._pbar.isVisible() != show_prog:
             self._pbar.setVisible(show_prog)
+
+        # Mise à jour du glow selon le nouveau style
+        if self._track.art_bytes and old_cfg.get("bg_style") != s.get("bg_style"):
+            threading.Thread(target=self._do_extract,
+                           args=(self._track.art_bytes, False), daemon=True).start()
 
         self._relayout()
         self.update()
