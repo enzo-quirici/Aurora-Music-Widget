@@ -76,6 +76,7 @@ DEFAULTS: dict = {
     "show_time":      True,
     "corner_radius":  22,
     "bg_alpha":       225,
+    "bg_style":       "wash",   # "wash" = blurred art, "gradient" = palette gradient
     "win_w":          DEFAULT_W,
     "win_h":          DEFAULT_H,
     "win_x":          -1,
@@ -532,7 +533,7 @@ class SettingsPanel(QWidget):
              "linux":"Linux (MPRIS2)","freebsd":"FreeBSD (MPRIS2)"}
 
     def __init__(self, settings: dict, accent: QColor, bg: QColor, parent=None):
-        super().__init__(parent, Qt.WindowType.Popup|Qt.WindowType.FramelessWindowHint)
+        super().__init__(parent, Qt.WindowType.Tool|Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._s   = dict(settings)
         # Derive panel palette from album art colours
@@ -605,6 +606,37 @@ class SettingsPanel(QWidget):
         root.addLayout(slider("opacity",      0.20,1.00,100,"{:.0f}%"))
         root.addLayout(slider("bg_alpha",     40,  255,  1, "{:.0f}"))
         root.addLayout(slider("corner_radius",8,   32,   1, "{:.0f}px"))
+
+        # ── Background style avec ScrollLabel ───────────────────────────────
+        bg_row = QHBoxLayout()
+        bg_label = ScrollLabel("Background style", px=12, bold=False,
+                               color=self._text_body, parent=self)
+        bg_label.setFixedWidth(140)
+
+        btn_wash = QPushButton("Fluent wash")
+        btn_grad = QPushButton("Colour gradient")
+
+        cur_style = self._s.get("bg_style", "wash")
+        _ACTIVE   = f"background:{acc_hex};color:#fff;border:none;border-radius:6px;padding:5px 12px;font-size:11px;"
+        _INACTIVE = f"background:rgba(0,0,0,70);color:{body_hex};border:1px solid {fill_hex};border-radius:6px;padding:5px 12px;font-size:11px;"
+
+        btn_wash.setStyleSheet(_ACTIVE if cur_style == "wash" else _INACTIVE)
+        btn_grad.setStyleSheet(_INACTIVE if cur_style == "wash" else _ACTIVE)
+
+        def _set_style(style):
+            self._s["bg_style"] = style
+            btn_wash.setStyleSheet(_ACTIVE if style == "wash" else _INACTIVE)
+            btn_grad.setStyleSheet(_INACTIVE if style == "wash" else _ACTIVE)
+            self.changed.emit(dict(self._s))
+
+        btn_wash.clicked.connect(lambda: _set_style("wash"))
+        btn_grad.clicked.connect(lambda: _set_style("gradient"))
+
+        bg_row.addWidget(bg_label)
+        bg_row.addStretch()
+        bg_row.addWidget(btn_wash)
+        bg_row.addWidget(btn_grad)
+        root.addLayout(bg_row)
         root.addWidget(sep())
         root.addWidget(H("GLOW"))
         root.addLayout(slider("glow_intensity",0.0,1.0,100,"{:.0f}%"))
@@ -866,13 +898,27 @@ class MusicWidget(QWidget):
     def _cmd(self,c): self._worker.cmd(self._player,c)
 
     def _apply_cfg(self, s: dict):
-        self._cfg=s
-        flags=Qt.WindowType.FramelessWindowHint
-        if s.get("always_on_top"): flags|=Qt.WindowType.WindowStaysOnTopHint
-        vis=self.isVisible(); self.setWindowFlags(flags)
-        if vis: self.show()
-        self._pbar.setVisible(bool(s.get("show_progress",True)))
-        self._relayout(); self.update()
+        """Apply settings from the panel."""
+        old_cfg = dict(self._cfg)
+        self._cfg = dict(s)
+
+        # Only recreate window flags when "always_on_top" actually changes
+        if old_cfg.get("always_on_top") != s.get("always_on_top"):
+            flags = Qt.WindowType.FramelessWindowHint
+            if s.get("always_on_top"):
+                flags |= Qt.WindowType.WindowStaysOnTopHint
+            vis = self.isVisible()
+            self.setWindowFlags(flags)
+            if vis:
+                self.show()
+
+        # Update progress bar visibility
+        show_prog = bool(s.get("show_progress", True))
+        if getattr(self, '_pbar', None) and self._pbar.isVisible() != show_prog:
+            self._pbar.setVisible(show_prog)
+
+        self._relayout()
+        self.update()
 
     # ── paint ─────────────────────────────────────────────────────────────────
     def paintEvent(self,_):
@@ -913,25 +959,54 @@ class MusicWidget(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(sc,1))
             p.drawRoundedRect(QRectF(cx+i,cy+i,cw-2*i,ch-2*i),cr+i*.4,cr+i*.4)
 
-        # ── card — album art gradient background ──────────────────────────────
-        card=QPainterPath(); card.addRoundedRect(QRectF(cx,cy,cw,ch),cr,cr)
-        bg_a=int(s.get("bg_alpha",225))
-        c_top= QColor(self._bg.cur);     c_top.setAlpha(bg_a)
-        c_mid= QColor(self._bg_mid.cur); c_mid.setAlpha(bg_a)
-        c_bot= QColor(self._bg_bot.cur); c_bot.setAlpha(bg_a)
-        gg=QLinearGradient(cx,cy,cx,cy+ch)
-        gg.setColorAt(0.00, c_top)
-        gg.setColorAt(0.50, c_mid)
-        gg.setColorAt(1.00, c_bot)
-        p.fillPath(card,QBrush(gg))
-        # Subtle top shimmer
-        sh=QLinearGradient(cx,cy,cx,cy+ch*.32)
-        sh.setColorAt(0,QColor(255,255,255,18)); sh.setColorAt(1,QColor(255,255,255,0))
-        p.fillPath(card,QBrush(sh))
+        # ── card background ───────────────────────────────────────────────────
+        card = QPainterPath(); card.addRoundedRect(QRectF(cx, cy, cw, ch), cr, cr)
+        bg_a  = int(s.get("bg_alpha", 225))
+        style = s.get("bg_style", "wash")
+        p.setClipPath(card)
+
+        if style == "wash" and self._art_px and not self._art_px.isNull():
+            # ── Fluent wash: 2-pass mosaic blur of album art ──────────────────
+            tiny = self._art_px.scaled(6, 6,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            wash = tiny.scaled(cw, ch,
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            # At max bg_alpha (255) the wash is fully opaque (no transparency bleed).
+            # At low bg_alpha it stays more translucent.
+            wash_opacity = (bg_a / 255.0) ** 0.6   # gamma curve: 225→0.93, 128→0.72
+            p.setOpacity(wash_opacity)
+            p.drawPixmap(cx, cy, wash)
+            p.setOpacity(1.0)
+            # Dark overlay — top lighter, bottom darker for readability
+            ov = QLinearGradient(cx, cy, cx, cy+ch)
+            ov.setColorAt(0.00, QColor(0, 0, 0, 85))
+            ov.setColorAt(0.42, QColor(0, 0, 0, 120))
+            ov.setColorAt(1.00, QColor(0, 0, 0, 175))
+            p.fillPath(card, QBrush(ov))
+        else:
+            # ── Colour gradient: 3-stop palette from album colours ────────────
+            c_top = QColor(self._bg.cur);     c_top.setAlpha(bg_a)
+            c_mid = QColor(self._bg_mid.cur); c_mid.setAlpha(bg_a)
+            c_bot = QColor(self._bg_bot.cur); c_bot.setAlpha(bg_a)
+            gg = QLinearGradient(cx, cy, cx, cy+ch)
+            gg.setColorAt(0.00, c_top)
+            gg.setColorAt(0.48, c_mid)
+            gg.setColorAt(1.00, c_bot)
+            p.fillPath(card, QBrush(gg))
+
+        p.setClipping(False)
+
+        # Glass shimmer on top edge
+        sh = QLinearGradient(cx, cy, cx, cy+ch*0.22)
+        sh.setColorAt(0, QColor(255, 255, 255, 28))
+        sh.setColorAt(1, QColor(255, 255, 255, 0))
+        p.fillPath(card, QBrush(sh))
         # Accent border
-        bc=QColor(self._acc.cur); bc.setAlpha(50)
-        p.setPen(QPen(bc,1)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(cx+.5,cy+.5,cw-1,ch-1),cr,cr)
+        bc = QColor(self._acc.cur); bc.setAlpha(60)
+        p.setPen(QPen(bc, 1)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(QRectF(cx+.5, cy+.5, cw-1, ch-1), cr, cr)
 
         # ── album art ─────────────────────────────────────────────────────────
         ax,ay,art_sz,_ = self._art_rect
@@ -982,15 +1057,22 @@ class MusicWidget(QWidget):
         return Edge.detect(pos, cw, ch, GLOW_PAD)
 
     def mousePressEvent(self, e):
-        if e.button()==Qt.MouseButton.LeftButton:
-            edge=self._hit_edge(e.position().toPoint())
-            if edge!=Edge.NONE:
-                self._resize_edge=edge
-                self._resize_origin=e.globalPosition().toPoint()
-                self._resize_start_geom=self.geometry()
+        if e.button() == Qt.MouseButton.LeftButton:
+            edge = self._hit_edge(e.position().toPoint())
+            if edge != Edge.NONE:
+                # Mode redimensionnement
+                self._resize_edge = edge
+                self._resize_origin = e.globalPosition().toPoint()
+                self._resize_start_geom = self.geometry()
             else:
-                self._drag=e.globalPosition().toPoint()-self.frameGeometry().topLeft()
-        elif e.button()==Qt.MouseButton.RightButton:
+                # Mode déplacement + fermer settings
+                self._drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+                # Ferme le panneau de paramètres si ouvert
+                if getattr(self, '_settings_panel', None) and self._settings_panel.isVisible():
+                    self._settings_panel.close()
+
+        elif e.button() == Qt.MouseButton.RightButton:
             self._open_settings(e.globalPosition().toPoint())
 
     def mouseMoveEvent(self, e):
@@ -1034,12 +1116,18 @@ class MusicWidget(QWidget):
         self.setGeometry(x,y,w,h)
 
     def _open_settings(self, gpos: QPoint):
-        panel=SettingsPanel(self._cfg, self._acc.cur, self._bg.cur, self)
+        # Toggle: if already open, close it
+        if getattr(self, '_settings_panel', None) and self._settings_panel.isVisible():
+            self._settings_panel.close()
+            return
+        panel = SettingsPanel(self._cfg, self._acc.cur, self._bg.cur, self)
+        panel.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         panel.changed.connect(self._apply_cfg)
-        screen=QApplication.primaryScreen().geometry()
-        sx=max(0,min(gpos.x()-panel.width()-8, screen.width()-panel.width()))
-        sy=max(0,min(gpos.y(), screen.height()-panel.height()-20))
-        panel.move(sx,sy); panel.show()
+        screen = QApplication.primaryScreen().geometry()
+        sx = max(0, min(gpos.x() - panel.width() - 8, screen.width() - panel.width()))
+        sy = max(0, min(gpos.y(), screen.height() - panel.height() - 20))
+        panel.move(sx, sy); panel.show()
+        self._settings_panel = panel
 
     def keyPressEvent(self, e):
         k=e.key()
